@@ -117,6 +117,87 @@ func (c *Client) Set(ctx context.Context, path string, e Entry) error {
 	return err
 }
 
+// ScanChan is like Scan but sends results through a channel instead of a callback,
+// avoiding mutex contention when shards run in parallel.
+func (c *Client) ScanChan(ctx context.Context, urlPrefix string) (<-chan ScanResult, <-chan error) {
+	resultCh := make(chan ScanResult, 4096)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(resultCh)
+		defer close(errCh)
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var firstErr error
+
+		for shard := 0; shard < indexShards; shard++ {
+			shard := shard
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				idxKey := fmt.Sprintf("%s%s:%d", indexPrefix, urlPrefix, shard)
+				var cursor uint64
+				for {
+					members, next, err := c.rdb.SScan(ctx, idxKey, cursor, "*", 1000).Result()
+					if err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						mu.Unlock()
+						return
+					}
+					if len(members) > 0 {
+						pipe := c.rdb.Pipeline()
+						cmds := make([]*redis.StringCmd, len(members))
+						for i, m := range members {
+							cmds[i] = pipe.Get(ctx, key(m))
+						}
+						_, pipeErr := pipe.Exec(ctx)
+						if pipeErr != nil && pipeErr != redis.Nil {
+							mu.Lock()
+							if firstErr == nil {
+								firstErr = pipeErr
+							}
+							mu.Unlock()
+							return
+						}
+						for i, m := range members {
+							val, err := cmds[i].Result()
+							if err != nil {
+								continue
+							}
+							select {
+							case resultCh <- ScanResult{Path: m, Entry: entryFromString(val)}:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+					cursor = next
+					if cursor == 0 {
+						break
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+		if firstErr != nil {
+			errCh <- firstErr
+		}
+	}()
+
+	return resultCh, errCh
+}
+
+// ScanResult holds a single cache entry returned by ScanChan.
+type ScanResult struct {
+	Path  string
+	Entry Entry
+}
+
 // Scan iterates all cached keys under urlPrefix using sharded index sets.
 // All 1000 shards are scanned in parallel, each shard has ~40K members
 // instead of one sequential scan over 40M members.
@@ -150,10 +231,12 @@ func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string
 					for i, m := range members {
 						cmds[i] = pipe.Get(ctx, key(m))
 					}
-					if _, err := pipe.Exec(ctx); err != nil {
+					_, pipeErr := pipe.Exec(ctx)
+					// redis.Nil is expected for missing keys in pipeline
+					if pipeErr != nil && pipeErr != redis.Nil {
 						mu.Lock()
 						if firstErr == nil {
-							firstErr = fmt.Errorf("shard %d pipeline failed: %w", shard, err)
+							firstErr = fmt.Errorf("shard %d pipeline failed: %w", shard, pipeErr)
 						}
 						mu.Unlock()
 						return
@@ -164,9 +247,7 @@ func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string
 							continue
 						}
 						e := entryFromString(val)
-						mu.Lock()
 						fn(m, e)
-						mu.Unlock()
 					}
 				}
 				cursor = next

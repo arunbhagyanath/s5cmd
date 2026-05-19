@@ -224,9 +224,6 @@ func (s Sync) Run(c *cli.Context) error {
 
 	onlySource, onlyDest, commonObjects := compareObjects(sourceObjects, destObjects, isBatch)
 
-	sourceObjects = nil
-	destObjects = nil
-
 	waiter := parallel.NewWaiter()
 	var (
 		merrorWaiter error
@@ -248,6 +245,9 @@ func (s Sync) Run(c *cli.Context) error {
 	}()
 
 	strategy := NewStrategy(s.sizeOnly)
+	if s.useCache {
+		strategy = &EtagAwareStrategy{Inner: strategy}
+	}
 	pipeReader, pipeWriter := io.Pipe()
 
 	var cacheClient *cache.Client
@@ -272,9 +272,9 @@ func (s Sync) Run(c *cli.Context) error {
 // sourceObjects and destObjects channels are already sorted in ascending order.
 // Returns objects those in only source, only destination
 // and both.
-func compareObjects(sourceObjects, destObjects chan *storage.Object, isSrcBatch bool) (chan *url.URL, chan *url.URL, chan *ObjectPair) {
+func compareObjects(sourceObjects, destObjects chan *storage.Object, isSrcBatch bool) (chan *storage.Object, chan *url.URL, chan *ObjectPair) {
 	var (
-		srcOnly   = make(chan *url.URL, extsortChannelBufferSize)
+		srcOnly   = make(chan *storage.Object, extsortChannelBufferSize)
 		dstOnly   = make(chan *url.URL, extsortChannelBufferSize)
 		commonObj = make(chan *ObjectPair, extsortChannelBufferSize)
 		srcName   string
@@ -302,7 +302,7 @@ func compareObjects(sourceObjects, destObjects chan *storage.Object, isSrcBatch 
 
 			if srcOk && dstOk {
 				if srcName < dstName {
-					srcOnly <- src.URL
+					srcOnly <- src
 					src, srcOk = <-sourceObjects
 				} else if srcName == dstName { // if there is a match.
 					commonObj <- &ObjectPair{src: src, dst: dst}
@@ -313,7 +313,7 @@ func compareObjects(sourceObjects, destObjects chan *storage.Object, isSrcBatch 
 					dst, dstOk = <-destObjects
 				}
 			} else if srcOk {
-				srcOnly <- src.URL
+				srcOnly <- src
 				src, srcOk = <-sourceObjects
 			} else if dstOk {
 				dstOnly <- dst.URL
@@ -468,7 +468,8 @@ func (s Sync) getSourceAndDestinationObjects(ctx context.Context, cancel context
 // planRun prepares the commands and writes them to writer 'w'.
 func (s Sync) planRun(
 	c *cli.Context,
-	onlySource, onlyDest chan *url.URL,
+	onlySource chan *storage.Object,
+	onlyDest chan *url.URL,
 	common chan *ObjectPair,
 	dsturl *url.URL,
 	strategy SyncStrategy,
@@ -492,11 +493,12 @@ func (s Sync) planRun(
 			modtime = *srcObj.ModTime
 		}
 		e := cache.Entry{Size: srcObj.Size, ModTime: modtime, Etag: srcObj.Etag}
-		if err := cacheClient.Set(ctx, srcObj.URL.Absolute(), e); err != nil {
-			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("cache update failed for %s: %v", srcObj.URL, err)})
+		entries := map[string]cache.Entry{
+			srcObj.URL.Absolute(): e,
+			dstURL.Absolute():     e,
 		}
-		if err := cacheClient.Set(ctx, dstURL.Absolute(), e); err != nil {
-			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("cache update failed for %s: %v", dstURL, err)})
+		if err := cacheClient.SetPipelined(ctx, entries); err != nil {
+			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("cache update failed: %v", err)})
 		}
 	}
 
@@ -508,11 +510,12 @@ func (s Sync) planRun(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for srcurl := range onlySource {
-			curDestURL := generateDestinationURL(srcurl, dsturl, isBatch)
-			command, err := generateCommand(c, "cp", defaultFlags, srcurl, curDestURL)
+		for srcObj := range onlySource {
+			curDestURL := generateDestinationURL(srcObj.URL, dsturl, isBatch)
+			updateCache(srcObj, curDestURL)
+			command, err := generateCommand(c, "cp", defaultFlags, srcObj.URL, curDestURL)
 			if err != nil {
-				printDebug(s.op, err, srcurl, curDestURL)
+				printDebug(s.op, err, srcObj.URL, curDestURL)
 				continue
 			}
 			fmt.Fprintln(w, command)
@@ -623,28 +626,35 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 			defer close(sortedCh)
 			defer client.Close()
 
-			// feed raw (unsorted) objects from Redis into extsort
+			// feed raw (unsorted) objects from Redis into extsort via channel-based scan
 			unsortedCh := make(chan extsort.SortType, extsortChannelBufferSize)
+			resultCh, scanErrCh := client.ScanChan(ctx, prefix)
+
 			go func() {
 				defer close(unsortedCh)
-				_ = client.Scan(ctx, prefix, func(path string, e cache.Entry) {
-					u, err := url.New(path, url.WithRaw(s.raw))
+				for r := range resultCh {
+					u, err := url.New(r.Path, url.WithRaw(s.raw))
 					if err != nil {
-						return
+						continue
 					}
 					u.SetRelative(baseurl)
-					modtime := e.ModTime
+					modtime := r.Entry.ModTime
 					obj := storage.Object{
 						URL:     u,
-						Size:    e.Size,
+						Size:    r.Entry.Size,
 						ModTime: &modtime,
-						Etag:    e.Etag,
+						Etag:    r.Entry.Etag,
 					}
 					select {
 					case unsortedCh <- obj:
 					case <-ctx.Done():
+						return
 					}
-				})
+				}
+				// drain scan errors
+				for err := range scanErrCh {
+					printError(s.fullCommand, s.op, err)
+				}
 			}()
 
 			sorter, outputCh, errCh := extsort.New(unsortedCh, storage.FromBytes, storage.Less, extsortConfig)

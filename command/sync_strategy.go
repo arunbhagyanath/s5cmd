@@ -19,6 +19,20 @@ func NewStrategy(sizeOnly bool) SyncStrategy {
 	}
 }
 
+// EtagAwareStrategy wraps another strategy but short-circuits when both objects
+// have matching non-empty etags (meaning content is identical). This is useful
+// for cache-based sync where etags are preserved.
+type EtagAwareStrategy struct {
+	Inner SyncStrategy
+}
+
+func (e *EtagAwareStrategy) ShouldSync(srcObj, dstObj *storage.Object) error {
+	if srcObj.Etag != "" && srcObj.Etag == dstObj.Etag {
+		return errorpkg.ErrObjectSizesMatch // content identical, skip
+	}
+	return e.Inner.ShouldSync(srcObj, dstObj)
+}
+
 // SizeOnlyStrategy determines to sync based on objects' file sizes.
 type SizeOnlyStrategy struct{}
 
