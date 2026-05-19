@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	cacheBuildBatchSize = 1000
-	numFlushWorkers     = 8
+	cacheBuildBatchSize    = 1000
+	defaultNumFlushWorkers = 8
 )
 
 var zeroTime = time.Time{}
@@ -28,7 +28,14 @@ func NewCacheBuildCommand() *cli.Command {
 		HelpName:  "cache-build",
 		Usage:     "build Redis cache for a source or destination path",
 		ArgsUsage: "path (local dir or s3://bucket/prefix)",
-		Action:    runCacheBuild,
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:  "cache-workers",
+				Value: defaultNumFlushWorkers,
+				Usage: "number of parallel workers flushing batches to Redis",
+			},
+		},
+		Action: runCacheBuild,
 	}
 }
 
@@ -60,7 +67,7 @@ func runCacheBuild(c *cli.Context) error {
 
 	log.Info(log.InfoMessage{Operation: "cache-build", Source: srcurl})
 
-	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl)
+	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl, c.Int("cache-workers"))
 	if err != nil {
 		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("cache build failed after %d objects: %v", count, err)})
 		return err
@@ -70,14 +77,14 @@ func runCacheBuild(c *cli.Context) error {
 	return nil
 }
 
-func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL) (int64, error) {
-	batchCh := make(chan map[string]cache.Entry, numFlushWorkers*2)
+func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL, workers int) (int64, error) {
+	batchCh := make(chan map[string]cache.Entry, workers*2)
 
 	var total atomic.Int64
-	errCh := make(chan error, numFlushWorkers)
+	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
-	for i := 0; i < numFlushWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
