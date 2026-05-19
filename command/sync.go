@@ -188,6 +188,7 @@ func (s Sync) Run(c *cli.Context) error {
 	}
 
 	ctx, cancel := context.WithCancel(c.Context)
+	defer cancel()
 
 	var sourceObjects, destObjects chan *storage.Object
 	if s.useCache {
