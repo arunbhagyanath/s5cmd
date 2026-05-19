@@ -596,36 +596,72 @@ func generateDestinationURL(srcurl, dsturl *url.URL, isBatch bool) *url.URL {
 }
 
 // getObjectsFromCache returns source and destination objects read from Redis
-// instead of performing live S3/filesystem listing.
+// sorted in ascending order, matching the contract expected by compareObjects.
 func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, dsturl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
-	client, err := cache.New(redisURL, 0)
+	// create two separate clients so each fill goroutine owns its connection
+	srcClient, err := cache.New(redisURL, 0)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	fill := func(prefix string) chan *storage.Object {
-		ch := make(chan *storage.Object, extsortChannelBufferSize)
-		go func() {
-			defer close(ch)
-			defer client.Close()
-			_ = client.Scan(ctx, prefix, func(path string, e cache.Entry) {
-				u, err := url.New(path, url.WithRaw(s.raw))
-				if err != nil {
-					ch <- &storage.Object{Err: err}
-					return
-				}
-				ch <- &storage.Object{
-					URL:     u,
-					Size:    e.Size,
-					ModTime: &e.ModTime,
-					Etag:    e.Etag,
-				}
-			})
-		}()
-		return ch
+	dstClient, err := cache.New(redisURL, 0)
+	if err != nil {
+		srcClient.Close()
+		return nil, nil, err
 	}
 
-	return fill(srcurl.Absolute()), fill(dsturl.Absolute()), nil
+	extsortDefaultConfig := extsort.DefaultConfig()
+	extsortConfig := &extsort.Config{
+		ChunkSize:          extsortChunkSize,
+		NumWorkers:         extsortDefaultConfig.NumWorkers,
+		ChanBuffSize:       extsortChannelBufferSize,
+		SortedChanBuffSize: extsortChannelBufferSize,
+	}
+
+	fill := func(client *cache.Client, prefix string) chan *storage.Object {
+		sortedCh := make(chan *storage.Object, extsortChannelBufferSize)
+		go func() {
+			defer close(sortedCh)
+			defer client.Close()
+
+			// feed raw (unsorted) objects from Redis into extsort
+			unsortedCh := make(chan extsort.SortType, extsortChannelBufferSize)
+			go func() {
+				defer close(unsortedCh)
+				_ = client.Scan(ctx, prefix, func(path string, e cache.Entry) {
+					u, err := url.New(path, url.WithRaw(s.raw))
+					if err != nil {
+						return
+					}
+					modtime := e.ModTime
+					obj := storage.Object{
+						URL:     u,
+						Size:    e.Size,
+						ModTime: &modtime,
+						Etag:    e.Etag,
+					}
+					select {
+					case unsortedCh <- obj:
+					case <-ctx.Done():
+					}
+				})
+			}()
+
+			sorter, outputCh, errCh := extsort.New(unsortedCh, storage.FromBytes, storage.Less, extsortConfig)
+			sorter.Sort(ctx)
+			for o := range outputCh {
+				obj := o.(storage.Object)
+				sortedCh <- &obj
+			}
+			go func() {
+				for err := range errCh {
+					printError(s.fullCommand, s.op, err)
+				}
+			}()
+		}()
+		return sortedCh
+	}
+
+	return fill(srcClient, srcurl.Absolute()), fill(dstClient, dsturl.Absolute()), nil
 }
 
 // shouldSkipObject checks is object should be skipped.
