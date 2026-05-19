@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,24 +36,31 @@ func (c *Client) Close() error { return c.rdb.Close() }
 
 func key(path string) string { return keyPrefix + path }
 
+func entryToString(e Entry) string {
+	return fmt.Sprintf("%d|%s|%s", e.Size, e.ModTime.UTC().Format(time.RFC3339Nano), e.Etag)
+}
+
+func entryFromString(s string) Entry {
+	parts := strings.SplitN(s, "|", 3)
+	if len(parts) != 3 {
+		return Entry{}
+	}
+	size, _ := strconv.ParseInt(parts[0], 10, 64)
+	modtime, _ := time.Parse(time.RFC3339Nano, parts[1])
+	return Entry{Size: size, ModTime: modtime, Etag: parts[2]}
+}
+
 func (c *Client) SetPipelined(ctx context.Context, entries map[string]Entry) error {
 	pipe := c.rdb.Pipeline()
 	for path, e := range entries {
-		pipe.HSet(ctx, key(path),
-			"size", e.Size,
-			"modtime", e.ModTime.UTC().Format(time.RFC3339Nano),
-			"etag", e.Etag,
-		)
-		if c.ttl > 0 {
-			pipe.Expire(ctx, key(path), c.ttl)
-		}
+		pipe.Set(ctx, key(path), entryToString(e), c.ttl)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
 // Scan iterates all cached keys under the given URL prefix, calling fn for each.
-// HGetAll calls within each SCAN page are parallelized.
+// GET calls within each SCAN page are parallelized.
 func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string, e Entry)) error {
 	pattern := keyPrefix + urlPrefix + "*"
 	var (
@@ -68,9 +76,9 @@ func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string
 		if len(keys) > 0 {
 			pages++
 			pipe := c.rdb.Pipeline()
-			cmds := make([]*redis.MapStringStringCmd, len(keys))
+			cmds := make([]*redis.StringCmd, len(keys))
 			for i, k := range keys {
-				cmds[i] = pipe.HGetAll(ctx, k)
+				cmds[i] = pipe.Get(ctx, k)
 			}
 			if _, err := pipe.Exec(ctx); err != nil {
 				return fmt.Errorf("cache scan pipeline failed on page %d: %w", pages, err)
@@ -83,15 +91,14 @@ func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					vals := cmds[i].Val()
-					if len(vals) == 0 {
+					val, err := cmds[i].Result()
+					if err != nil {
 						return
 					}
-					size, _ := strconv.ParseInt(vals["size"], 10, 64)
-					modtime, _ := time.Parse(time.RFC3339Nano, vals["modtime"])
+					e := entryFromString(val)
 					path := k[len(keyPrefix):]
 					mu.Lock()
-					fn(path, Entry{Size: size, ModTime: modtime, Etag: vals["etag"]})
+					fn(path, e)
 					mu.Unlock()
 				}()
 			}
