@@ -2,12 +2,15 @@ package command
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urfave/cli/v2"
 
 	"github.com/peak/s5cmd/v2/cache"
+	"github.com/peak/s5cmd/v2/log"
 	"github.com/peak/s5cmd/v2/storage"
 	"github.com/peak/s5cmd/v2/storage/url"
 )
@@ -37,6 +40,7 @@ func runCacheBuild(c *cli.Context) error {
 
 	client, err := cache.New(redisURL, 0)
 	if err != nil {
+		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("failed to connect to Redis: %v", err)})
 		return err
 	}
 	defer client.Close()
@@ -44,31 +48,48 @@ func runCacheBuild(c *cli.Context) error {
 	ctx := c.Context
 	srcurl, err := url.New(c.Args().First())
 	if err != nil {
+		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("invalid path: %v", err)})
 		return err
 	}
 
 	storageClient, err := storage.NewClient(ctx, srcurl, NewStorageOpts(c))
 	if err != nil {
+		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("failed to create storage client: %v", err)})
 		return err
 	}
 
-	return parallelCacheBuild(ctx, client, storageClient, srcurl)
+	log.Info(log.InfoMessage{Operation: "cache-build", Source: srcurl})
+
+	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl)
+	if err != nil {
+		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("cache build failed after %d objects: %v", count, err)})
+		return err
+	}
+
+	log.Info(cacheBuildDoneMessage{Source: srcurl.Absolute(), Count: count})
+	return nil
 }
 
-func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL) error {
+func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL) (int64, error) {
 	batchCh := make(chan map[string]cache.Entry, numFlushWorkers*2)
 
+	var total atomic.Int64
 	errCh := make(chan error, numFlushWorkers)
 	var wg sync.WaitGroup
+
 	for i := 0; i < numFlushWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for batch := range batchCh {
 				if err := client.SetPipelined(ctx, batch); err != nil {
+					log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("redis pipeline flush failed: %v", err)})
 					errCh <- err
 					return
 				}
+				n := int64(len(batch))
+				total.Add(n)
+				log.Debug(cacheBuildProgressMessage{Count: total.Load(), BatchSize: n})
 			}
 		}()
 	}
@@ -77,7 +98,11 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 		defer close(batchCh)
 		batch := make(map[string]cache.Entry, cacheBuildBatchSize)
 		for obj := range storageClient.List(ctx, srcurl, true) {
-			if obj.Err != nil || obj.Type.IsDir() {
+			if obj.Err != nil {
+				log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("listing error: %v", obj.Err)})
+				continue
+			}
+			if obj.Type.IsDir() {
 				continue
 			}
 			modtime := zeroTime
@@ -89,6 +114,7 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 				ModTime: modtime,
 				Etag:    obj.Etag,
 			}
+			log.Debug(cacheBuildObjectMessage{Path: obj.URL.Absolute(), Size: obj.Size})
 			if len(batch) >= cacheBuildBatchSize {
 				batchCh <- batch
 				batch = make(map[string]cache.Entry, cacheBuildBatchSize)
@@ -101,5 +127,44 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 
 	wg.Wait()
 	close(errCh)
-	return <-errCh
+	return total.Load(), <-errCh
+}
+
+type cacheBuildDoneMessage struct {
+	Source string `json:"source"`
+	Count  int64  `json:"count"`
+}
+
+func (m cacheBuildDoneMessage) String() string {
+	return fmt.Sprintf("cache-build finished: %d objects cached from %s", m.Count, m.Source)
+}
+
+func (m cacheBuildDoneMessage) JSON() string {
+	return fmt.Sprintf(`{"operation":"cache-build","source":%q,"count":%d,"success":true}`, m.Source, m.Count)
+}
+
+type cacheBuildProgressMessage struct {
+	Count     int64 `json:"total"`
+	BatchSize int64 `json:"batch_size"`
+}
+
+func (m cacheBuildProgressMessage) String() string {
+	return fmt.Sprintf("cache-build progress: %d objects cached (batch: %d)", m.Count, m.BatchSize)
+}
+
+func (m cacheBuildProgressMessage) JSON() string {
+	return fmt.Sprintf(`{"operation":"cache-build","total":%d,"batch_size":%d}`, m.Count, m.BatchSize)
+}
+
+type cacheBuildObjectMessage struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+func (m cacheBuildObjectMessage) String() string {
+	return fmt.Sprintf("cache-build index: %s (%d bytes)", m.Path, m.Size)
+}
+
+func (m cacheBuildObjectMessage) JSON() string {
+	return fmt.Sprintf(`{"operation":"cache-build","path":%q,"size":%d}`, m.Path, m.Size)
 }

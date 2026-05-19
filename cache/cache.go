@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -54,20 +55,25 @@ func (c *Client) SetPipelined(ctx context.Context, entries map[string]Entry) err
 // HGetAll calls within each SCAN page are parallelized.
 func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string, e Entry)) error {
 	pattern := keyPrefix + urlPrefix + "*"
-	var cursor uint64
+	var (
+		cursor uint64
+		pages  int
+		total  int
+	)
 	for {
 		keys, next, err := c.rdb.Scan(ctx, cursor, pattern, 1000).Result()
 		if err != nil {
-			return err
+			return fmt.Errorf("cache scan failed at cursor %d after %d objects: %w", cursor, total, err)
 		}
 		if len(keys) > 0 {
+			pages++
 			pipe := c.rdb.Pipeline()
 			cmds := make([]*redis.MapStringStringCmd, len(keys))
 			for i, k := range keys {
 				cmds[i] = pipe.HGetAll(ctx, k)
 			}
 			if _, err := pipe.Exec(ctx); err != nil {
-				return err
+				return fmt.Errorf("cache scan pipeline failed on page %d: %w", pages, err)
 			}
 
 			var wg sync.WaitGroup
@@ -90,6 +96,7 @@ func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string
 				}()
 			}
 			wg.Wait()
+			total += len(keys)
 		}
 		cursor = next
 		if cursor == 0 {
