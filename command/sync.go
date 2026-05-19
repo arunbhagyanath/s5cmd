@@ -617,7 +617,7 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 		SortedChanBuffSize: extsortChannelBufferSize,
 	}
 
-	fill := func(client *cache.Client, prefix string) chan *storage.Object {
+	fill := func(client *cache.Client, prefix string, baseurl *url.URL) chan *storage.Object {
 		sortedCh := make(chan *storage.Object, extsortChannelBufferSize)
 		go func() {
 			defer close(sortedCh)
@@ -632,6 +632,7 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 					if err != nil {
 						return
 					}
+					u.SetRelative(baseurl)
 					modtime := e.ModTime
 					obj := storage.Object{
 						URL:     u,
@@ -661,7 +662,7 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 		return sortedCh
 	}
 
-	return fill(srcClient, srcurl.Absolute()), fill(dstClient, dsturl.Absolute()), nil
+	return fill(srcClient, srcurl.Absolute(), srcurl), fill(dstClient, dsturl.Absolute(), dsturl), nil
 }
 
 // shouldSkipObject checks is object should be skipped.

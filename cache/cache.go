@@ -11,7 +11,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const keyPrefix = "s5cmd:cache:"
+const (
+	keyPrefix   = "s5cmd:cache:"
+	indexPrefix = "s5cmd:index:"
+	indexShards = 1000 // number of index shards per prefix
+)
 
 type Entry struct {
 	Size    int64
@@ -36,6 +40,41 @@ func (c *Client) Close() error { return c.rdb.Close() }
 
 func key(path string) string { return keyPrefix + path }
 
+// shardKey returns the index set key for a given path.
+// Shards by FNV hash so 40M keys spread across 1000 sets (~40K members each).
+// e.g. "s5cmd:index:s3://bucket/:42"
+func shardKey(prefix, path string) string {
+	h := fnv32(path)
+	return fmt.Sprintf("%s%s:%d", indexPrefix, prefix, h%indexShards)
+}
+
+// bucketPrefix extracts the top-level prefix from an absolute path.
+// "s3://bucket/blob-data#123" → "s3://bucket/"
+// "/data/blobs/blob-data#123" → "/data/blobs/"
+func bucketPrefix(path string) string {
+	if strings.HasPrefix(path, "s3://") {
+		rest := path[len("s3://"):]
+		if idx := strings.Index(rest, "/"); idx >= 0 {
+			return "s3://" + rest[:idx+1]
+		}
+		return path + "/"
+	}
+	trimmed := strings.TrimRight(path, "/")
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+		return trimmed[:idx+1]
+	}
+	return "/"
+}
+
+func fnv32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
 func entryToString(e Entry) string {
 	return fmt.Sprintf("%d|%s|%s", e.Size, e.ModTime.UTC().Format(time.RFC3339Nano), e.Etag)
 }
@@ -54,77 +93,90 @@ func (c *Client) SetPipelined(ctx context.Context, entries map[string]Entry) err
 	pipe := c.rdb.Pipeline()
 	for path, e := range entries {
 		pipe.Set(ctx, key(path), entryToString(e), c.ttl)
+		pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
-// SetIfAbsentPipelined sets entries only if the key does not already exist.
-// Used by cache-build --resume to skip already-cached keys.
 func (c *Client) SetIfAbsentPipelined(ctx context.Context, entries map[string]Entry) error {
 	pipe := c.rdb.Pipeline()
 	for path, e := range entries {
 		pipe.SetNX(ctx, key(path), entryToString(e), c.ttl)
+		pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
 	}
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
-// Set upserts a single entry. Used by sync to update cache after a successful copy.
 func (c *Client) Set(ctx context.Context, path string, e Entry) error {
-	return c.rdb.Set(ctx, key(path), entryToString(e), c.ttl).Err()
+	pipe := c.rdb.Pipeline()
+	pipe.Set(ctx, key(path), entryToString(e), c.ttl)
+	pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
-// Scan iterates all cached keys under the given URL prefix, calling fn for each.
-// GET calls within each SCAN page are parallelized.
+// Scan iterates all cached keys under urlPrefix using sharded index sets.
+// All 1000 shards are scanned in parallel, each shard has ~40K members
+// instead of one sequential scan over 40M members.
 func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string, e Entry)) error {
-	pattern := keyPrefix + urlPrefix + "*"
 	var (
-		cursor uint64
-		pages  int
-		total  int
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
 	)
-	for {
-		keys, next, err := c.rdb.Scan(ctx, cursor, pattern, 1000).Result()
-		if err != nil {
-			return fmt.Errorf("cache scan failed at cursor %d after %d objects: %w", cursor, total, err)
-		}
-		if len(keys) > 0 {
-			pages++
-			pipe := c.rdb.Pipeline()
-			cmds := make([]*redis.StringCmd, len(keys))
-			for i, k := range keys {
-				cmds[i] = pipe.Get(ctx, k)
-			}
-			if _, err := pipe.Exec(ctx); err != nil {
-				return fmt.Errorf("cache scan pipeline failed on page %d: %w", pages, err)
-			}
 
-			var wg sync.WaitGroup
-			var mu sync.Mutex
-			for i, k := range keys {
-				i, k := i, k
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					val, err := cmds[i].Result()
-					if err != nil {
+	for shard := 0; shard < indexShards; shard++ {
+		shard := shard
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			idxKey := fmt.Sprintf("%s%s:%d", indexPrefix, urlPrefix, shard)
+			var cursor uint64
+			for {
+				members, next, err := c.rdb.SScan(ctx, idxKey, cursor, "*", 1000).Result()
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("shard %d scan failed: %w", shard, err)
+					}
+					mu.Unlock()
+					return
+				}
+				if len(members) > 0 {
+					pipe := c.rdb.Pipeline()
+					cmds := make([]*redis.StringCmd, len(members))
+					for i, m := range members {
+						cmds[i] = pipe.Get(ctx, key(m))
+					}
+					if _, err := pipe.Exec(ctx); err != nil {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("shard %d pipeline failed: %w", shard, err)
+						}
+						mu.Unlock()
 						return
 					}
-					e := entryFromString(val)
-					path := k[len(keyPrefix):]
-					mu.Lock()
-					fn(path, e)
-					mu.Unlock()
-				}()
+					for i, m := range members {
+						val, err := cmds[i].Result()
+						if err != nil {
+							continue
+						}
+						e := entryFromString(val)
+						mu.Lock()
+						fn(m, e)
+						mu.Unlock()
+					}
+				}
+				cursor = next
+				if cursor == 0 {
+					break
+				}
 			}
-			wg.Wait()
-			total += len(keys)
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
+		}()
 	}
-	return nil
+
+	wg.Wait()
+	return firstErr
 }
