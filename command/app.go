@@ -90,6 +90,11 @@ var app = &cli.App{
 			Name:  "credentials-file",
 			Usage: "use the specified credentials file instead of the default credentials file",
 		},
+		&cli.StringFlag{
+			Name:    "redis-url",
+			Usage:   "Redis URL for caching (e.g. redis://localhost:6379)",
+			EnvVars: []string{"S5CMD_REDIS_URL"},
+		},
 	},
 	Before: func(c *cli.Context) error {
 		retryCount := c.Int("retry-count")
@@ -207,6 +212,7 @@ func Commands() []*cli.Command {
 		NewPipeCommand(),
 		NewRunCommand(),
 		NewSyncCommand(),
+		NewCacheBuildCommand(),
 		NewVersionCommand(),
 		NewBucketVersionCommand(),
 		NewPresignCommand(),

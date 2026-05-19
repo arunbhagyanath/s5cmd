@@ -14,6 +14,7 @@ import (
 	"github.com/lanrat/extsort"
 	"github.com/urfave/cli/v2"
 
+	"github.com/peak/s5cmd/v2/cache"
 	errorpkg "github.com/peak/s5cmd/v2/error"
 	"github.com/peak/s5cmd/v2/log"
 	"github.com/peak/s5cmd/v2/log/stat"
@@ -85,6 +86,10 @@ func NewSyncCommandFlags() []cli.Flag {
 			Name:  "exit-on-error",
 			Usage: "stops the sync process if an error is received",
 		},
+		&cli.BoolFlag{
+			Name:  "use-cache",
+			Usage: "use Redis cache instead of live listing for source and destination",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(syncFlags, sharedFlags...)
@@ -131,6 +136,7 @@ type Sync struct {
 	delete      bool
 	sizeOnly    bool
 	exitOnError bool
+	useCache    bool
 
 	// s3 options
 	storageOpts storage.Options
@@ -155,6 +161,7 @@ func NewSync(c *cli.Context) Sync {
 		delete:      c.Bool("delete"),
 		sizeOnly:    c.Bool("size-only"),
 		exitOnError: c.Bool("exit-on-error"),
+		useCache:    c.Bool("use-cache"),
 
 		// flags
 		followSymlinks: !c.Bool("no-follow-symlinks"),
@@ -182,7 +189,16 @@ func (s Sync) Run(c *cli.Context) error {
 
 	ctx, cancel := context.WithCancel(c.Context)
 
-	sourceObjects, destObjects, err := s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
+	var sourceObjects, destObjects chan *storage.Object
+	if s.useCache {
+		redisURL := c.String("redis-url")
+		if redisURL == "" {
+			redisURL = "redis://localhost:6379"
+		}
+		sourceObjects, destObjects, err = s.getObjectsFromCache(ctx, redisURL, srcurl, dsturl)
+	} else {
+		sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
+	}
 	if err != nil {
 		printError(s.fullCommand, s.op, err)
 		return err
@@ -547,6 +563,39 @@ func generateDestinationURL(srcurl, dsturl *url.URL, isBatch bool) *url.URL {
 	}
 
 	return dsturl.Join(objname)
+}
+
+// getObjectsFromCache returns source and destination objects read from Redis
+// instead of performing live S3/filesystem listing.
+func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, dsturl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
+	client, err := cache.New(redisURL, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	fill := func(prefix string) chan *storage.Object {
+		ch := make(chan *storage.Object, extsortChannelBufferSize)
+		go func() {
+			defer close(ch)
+			defer client.Close()
+			_ = client.Scan(ctx, prefix, func(path string, e cache.Entry) {
+				u, err := url.New(path, url.WithRaw(s.raw))
+				if err != nil {
+					ch <- &storage.Object{Err: err}
+					return
+				}
+				ch <- &storage.Object{
+					URL:     u,
+					Size:    e.Size,
+					ModTime: &e.ModTime,
+					Etag:    e.Etag,
+				}
+			})
+		}()
+		return ch
+	}
+
+	return fill(srcurl.Absolute()), fill(dsturl.Absolute()), nil
 }
 
 // shouldSkipObject checks is object should be skipped.
