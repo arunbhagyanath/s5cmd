@@ -34,6 +34,10 @@ func NewCacheBuildCommand() *cli.Command {
 				Value: defaultNumFlushWorkers,
 				Usage: "number of parallel workers flushing batches to Redis",
 			},
+			&cli.BoolFlag{
+				Name:  "resume",
+				Usage: "skip objects already present in cache, allowing interrupted builds to continue",
+			},
 		},
 		Action: runCacheBuild,
 	}
@@ -67,7 +71,7 @@ func runCacheBuild(c *cli.Context) error {
 
 	log.Info(log.InfoMessage{Operation: "cache-build", Source: srcurl})
 
-	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl, c.Int("cache-workers"))
+	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl, c.Int("cache-workers"), c.Bool("resume"))
 	if err != nil {
 		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("cache build failed after %d objects: %v", count, err)})
 		return err
@@ -77,7 +81,7 @@ func runCacheBuild(c *cli.Context) error {
 	return nil
 }
 
-func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL, workers int) (int64, error) {
+func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL, workers int, resume bool) (int64, error) {
 	batchCh := make(chan map[string]cache.Entry, workers*2)
 
 	var total atomic.Int64
@@ -89,7 +93,13 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 		go func() {
 			defer wg.Done()
 			for batch := range batchCh {
-				if err := client.SetPipelined(ctx, batch); err != nil {
+				var err error
+				if resume {
+					err = client.SetIfAbsentPipelined(ctx, batch)
+				} else {
+					err = client.SetPipelined(ctx, batch)
+				}
+				if err != nil {
 					log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("redis pipeline flush failed: %v", err)})
 					errCh <- err
 					return

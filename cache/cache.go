@@ -59,6 +59,22 @@ func (c *Client) SetPipelined(ctx context.Context, entries map[string]Entry) err
 	return err
 }
 
+// SetIfAbsentPipelined sets entries only if the key does not already exist.
+// Used by cache-build --resume to skip already-cached keys.
+func (c *Client) SetIfAbsentPipelined(ctx context.Context, entries map[string]Entry) error {
+	pipe := c.rdb.Pipeline()
+	for path, e := range entries {
+		pipe.SetNX(ctx, key(path), entryToString(e), c.ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// Set upserts a single entry. Used by sync to update cache after a successful copy.
+func (c *Client) Set(ctx context.Context, path string, e Entry) error {
+	return c.rdb.Set(ctx, key(path), entryToString(e), c.ttl).Err()
+}
+
 // Scan iterates all cached keys under the given URL prefix, calling fn for each.
 // GET calls within each SCAN page are parallelized.
 func (c *Client) Scan(ctx context.Context, urlPrefix string, fn func(path string, e Entry)) error {

@@ -137,6 +137,7 @@ type Sync struct {
 	sizeOnly    bool
 	exitOnError bool
 	useCache    bool
+	redisURL    string
 
 	// s3 options
 	storageOpts storage.Options
@@ -162,6 +163,7 @@ func NewSync(c *cli.Context) Sync {
 		sizeOnly:    c.Bool("size-only"),
 		exitOnError: c.Bool("exit-on-error"),
 		useCache:    c.Bool("use-cache"),
+		redisURL:    c.String("redis-url"),
 
 		// flags
 		followSymlinks: !c.Bool("no-follow-symlinks"),
@@ -245,11 +247,22 @@ func (s Sync) Run(c *cli.Context) error {
 		}
 	}()
 
-	strategy := NewStrategy(s.sizeOnly) // create comparison strategy.
-	pipeReader, pipeWriter := io.Pipe() // create a reader, writer pipe to pass commands to run
+	strategy := NewStrategy(s.sizeOnly)
+	pipeReader, pipeWriter := io.Pipe()
 
-	// Create commands in background.
-	go s.planRun(c, onlySource, onlyDest, commonObjects, dsturl, strategy, pipeWriter, isBatch)
+	var cacheClient *cache.Client
+	if s.redisURL != "" {
+		var err error
+		cacheClient, err = cache.New(s.redisURL, 0)
+		if err != nil {
+			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("failed to connect to Redis for cache update: %v", err)})
+		}
+		if cacheClient != nil {
+			defer cacheClient.Close()
+		}
+	}
+
+	go s.planRun(c, onlySource, onlyDest, commonObjects, dsturl, strategy, pipeWriter, isBatch, cacheClient)
 
 	err = NewRun(c, pipeReader).Run(ctx)
 	return multierror.Append(err, merrorWaiter).ErrorOrNil()
@@ -461,14 +474,30 @@ func (s Sync) planRun(
 	strategy SyncStrategy,
 	w io.WriteCloser,
 	isBatch bool,
+	cacheClient *cache.Client,
 ) {
 	defer w.Close()
 
-	// Always use raw mode since sync command generates commands
-	// from raw S3 objects. Otherwise, generated copy command will
-	// try to expand given source.
 	defaultFlags := map[string]interface{}{
 		"raw": true,
+	}
+
+	updateCache := func(srcObj *storage.Object, dstURL *url.URL) {
+		if cacheClient == nil || srcObj == nil {
+			return
+		}
+		ctx := c.Context
+		modtime := zeroTime
+		if srcObj.ModTime != nil {
+			modtime = *srcObj.ModTime
+		}
+		e := cache.Entry{Size: srcObj.Size, ModTime: modtime, Etag: srcObj.Etag}
+		if err := cacheClient.Set(ctx, srcObj.URL.Absolute(), e); err != nil {
+			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("cache update failed for %s: %v", srcObj.URL, err)})
+		}
+		if err := cacheClient.Set(ctx, dstURL.Absolute(), e); err != nil {
+			log.Error(log.ErrorMessage{Operation: s.op, Err: fmt.Sprintf("cache update failed for %s: %v", dstURL, err)})
+		}
 	}
 
 	// it should wait until both of the child goroutines for onlySource and common channels
@@ -497,12 +526,12 @@ func (s Sync) planRun(
 		for commonObject := range common {
 			sourceObject, destObject := commonObject.src, commonObject.dst
 			curSourceURL, curDestURL := sourceObject.URL, destObject.URL
-			err := strategy.ShouldSync(sourceObject, destObject) // check if object should be copied.
+			err := strategy.ShouldSync(sourceObject, destObject)
 			if err != nil {
 				printDebug(s.op, err, curSourceURL, curDestURL)
 				continue
 			}
-
+			updateCache(sourceObject, curDestURL)
 			command, err := generateCommand(c, "cp", defaultFlags, curSourceURL, curDestURL)
 			if err != nil {
 				printDebug(s.op, err, curSourceURL, curDestURL)
