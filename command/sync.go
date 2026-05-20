@@ -959,6 +959,7 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			if s.shouldSkipSrcObject(obj, false) {
 				continue
 			}
+			obj.URL.SetRelative(srcurl)
 			newObjects = append(newObjects, obj)
 			if obj.URL.Path > lastKey {
 				lastKey = obj.URL.Path
