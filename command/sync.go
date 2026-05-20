@@ -751,8 +751,6 @@ func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFu
 	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
 
 	go func() {
-		defer close(sourceObjects)
-		defer close(destObjects)
 		defer srcClient.Close()
 		defer dstCacheClient.Close()
 
@@ -771,10 +769,14 @@ func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFu
 		modifiedEntries, err := srcClient.ScanModifiedAfter(ctx, srcPrefix, modifiedAfter)
 		if err != nil {
 			printError(s.fullCommand, s.op, err)
+			close(sourceObjects)
+			close(destObjects)
 			return
 		}
 
 		if len(modifiedEntries) == 0 {
+			close(sourceObjects)
+			close(destObjects)
 			return
 		}
 
@@ -846,16 +848,20 @@ func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFu
 			}
 		}
 
-		// Emit source and destination objects in sorted order
+		// Build pairs to emit via separate goroutines (avoids deadlock with compareObjects)
+		type pair struct {
+			src *storage.Object
+			dst *storage.Object
+		}
+		pairs := make([]pair, len(sortedSrc))
 		for i, srcObj := range sortedSrc {
-			sourceObjects <- srcObj
-
+			pairs[i].src = srcObj
 			if dstEntry, ok := dstEntryMap[dstPaths[i]]; ok {
 				dstURL, err := url.New(dstPaths[i], url.WithRaw(s.raw))
 				if err == nil {
 					dstURL.SetRelative(dsturl)
 					modtime := dstEntry.ModTime
-					destObjects <- &storage.Object{
+					pairs[i].dst = &storage.Object{
 						URL:     dstURL,
 						Size:    dstEntry.Size,
 						ModTime: &modtime,
@@ -864,6 +870,26 @@ func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFu
 				}
 			}
 		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for _, p := range pairs {
+				sourceObjects <- p.src
+			}
+			close(sourceObjects)
+		}()
+		go func() {
+			defer wg.Done()
+			for _, p := range pairs {
+				if p.dst != nil {
+					destObjects <- p.dst
+				}
+			}
+			close(destObjects)
+		}()
+		wg.Wait()
 	}()
 
 	return sourceObjects, destObjects, nil
@@ -897,9 +923,15 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
 	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
 
+	// We collect all objects first, then emit via separate goroutines to avoid
+	// deadlock: compareObjects reads both channels in merge-sort fashion, so
+	// writing both from one goroutine can block when buffers fill.
+	type pair struct {
+		src *storage.Object
+		dst *storage.Object // nil if not in destination cache
+	}
+
 	go func() {
-		defer close(sourceObjects)
-		defer close(destObjects)
 		defer dstCacheClient.Close()
 
 		// List from S3 with StartAfter — S3 only returns keys > startAfterKey
@@ -907,7 +939,6 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 		if startAfterKey != "" {
 			objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
 		} else {
-			// First run: list everything
 			objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
 		}
 
@@ -919,6 +950,8 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 				if s.shouldStopSync(obj.Err) {
 					printError(s.fullCommand, s.op, obj.Err)
 					cancel()
+					close(sourceObjects)
+					close(destObjects)
 					return
 				}
 				continue
@@ -933,6 +966,8 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 		}
 
 		if len(newObjects) == 0 {
+			close(sourceObjects)
+			close(destObjects)
 			return
 		}
 
@@ -977,16 +1012,16 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
-		// Emit objects (S3 ListObjects already returns in sorted key order)
+		// Build pairs
+		pairs := make([]pair, len(newObjects))
 		for i, srcObj := range newObjects {
-			sourceObjects <- srcObj
-
+			pairs[i].src = srcObj
 			if dstEntry, ok := dstEntryMap[dstPaths[i]]; ok {
 				dstURL, err := url.New(dstPaths[i], url.WithRaw(s.raw))
 				if err == nil {
 					dstURL.SetRelative(dsturl)
 					modtime := dstEntry.ModTime
-					destObjects <- &storage.Object{
+					pairs[i].dst = &storage.Object{
 						URL:     dstURL,
 						Size:    dstEntry.Size,
 						ModTime: &modtime,
@@ -995,6 +1030,27 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 				}
 			}
 		}
+
+		// Emit via separate goroutines to avoid deadlock with compareObjects
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for _, p := range pairs {
+				sourceObjects <- p.src
+			}
+			close(sourceObjects)
+		}()
+		go func() {
+			defer wg.Done()
+			for _, p := range pairs {
+				if p.dst != nil {
+					destObjects <- p.dst
+				}
+			}
+			close(destObjects)
+		}()
+		wg.Wait()
 	}()
 
 	return sourceObjects, destObjects, nil
