@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/hashicorp/go-multierror"
@@ -90,6 +91,14 @@ func NewSyncCommandFlags() []cli.Flag {
 			Name:  "use-cache",
 			Usage: "use Redis cache instead of live listing for source and destination",
 		},
+		&cli.BoolFlag{
+			Name:  "since-last-sync",
+			Usage: "only consider source objects modified since the last successful sync (requires --use-cache)",
+		},
+		&cli.BoolFlag{
+			Name:  "start-after",
+			Usage: "use S3 StartAfter to list only objects with keys after the last synced key (append-only ordered sources, requires --use-cache)",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(syncFlags, sharedFlags...)
@@ -133,11 +142,13 @@ type Sync struct {
 	fullCommand string
 
 	// flags
-	delete      bool
-	sizeOnly    bool
-	exitOnError bool
-	useCache    bool
-	redisURL    string
+	delete        bool
+	sizeOnly      bool
+	exitOnError   bool
+	useCache      bool
+	sinceLastSync bool
+	startAfter    bool
+	redisURL      string
 
 	// s3 options
 	storageOpts storage.Options
@@ -159,11 +170,13 @@ func NewSync(c *cli.Context) Sync {
 		fullCommand: commandFromContext(c),
 
 		// flags
-		delete:      c.Bool("delete"),
-		sizeOnly:    c.Bool("size-only"),
-		exitOnError: c.Bool("exit-on-error"),
-		useCache:    c.Bool("use-cache"),
-		redisURL:    c.String("redis-url"),
+		delete:        c.Bool("delete"),
+		sizeOnly:      c.Bool("size-only"),
+		exitOnError:   c.Bool("exit-on-error"),
+		useCache:      c.Bool("use-cache"),
+		sinceLastSync: c.Bool("since-last-sync"),
+		startAfter:    c.Bool("start-after"),
+		redisURL:      c.String("redis-url"),
 
 		// flags
 		followSymlinks: !c.Bool("no-follow-symlinks"),
@@ -192,13 +205,36 @@ func (s Sync) Run(c *cli.Context) error {
 	ctx, cancel := context.WithCancel(c.Context)
 	defer cancel()
 
+	// Record sync start time before we begin (used for --since-last-sync on next run)
+	syncStartTime := time.Now().UTC()
+
 	var sourceObjects, destObjects chan *storage.Object
 	if s.useCache {
 		redisURL := c.String("redis-url")
 		if redisURL == "" {
 			redisURL = "redis://localhost:6379"
 		}
-		sourceObjects, destObjects, err = s.getObjectsFromCache(ctx, redisURL, srcurl, dsturl)
+
+		// Determine the modifiedAfter filter
+		var modifiedAfter time.Time
+		if s.sinceLastSync {
+			timeClient, err := cache.New(redisURL, 0)
+			if err == nil {
+				modifiedAfter, _ = timeClient.GetLastSyncTime(ctx, s.src, s.dst)
+				timeClient.Close()
+			}
+		}
+
+		if s.startAfter {
+			// StartAfter mode: use S3 StartAfter to only list objects with keys
+			// after the last synced key. Zero full scans, minimal S3 pages.
+			sourceObjects, destObjects, err = s.getObjectsStartAfter(ctx, cancel, redisURL, srcurl, dsturl)
+		} else if s.sinceLastSync && !modifiedAfter.IsZero() {
+			// Incremental mode: use time-indexed cache (ZRANGEBYSCORE)
+			sourceObjects, destObjects, err = s.getObjectsIncremental(ctx, cancel, redisURL, srcurl, dsturl, modifiedAfter)
+		} else {
+			sourceObjects, destObjects, err = s.getObjectsFromCache(ctx, redisURL, srcurl, dsturl)
+		}
 	} else {
 		sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
 	}
@@ -265,6 +301,16 @@ func (s Sync) Run(c *cli.Context) error {
 	go s.planRun(c, onlySource, onlyDest, commonObjects, dsturl, strategy, pipeWriter, isBatch, cacheClient)
 
 	err = NewRun(c, pipeReader).Run(ctx)
+
+	// Record last sync time on success
+	if err == nil && s.useCache && s.redisURL != "" {
+		tsClient, tsErr := cache.New(s.redisURL, 0)
+		if tsErr == nil {
+			_ = tsClient.SetLastSyncTime(ctx, s.src, s.dst, syncStartTime)
+			tsClient.Close()
+		}
+	}
+
 	return multierror.Append(err, merrorWaiter).ErrorOrNil()
 }
 
@@ -673,6 +719,283 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 	}
 
 	return fill(srcClient, srcurl.Absolute(), srcurl), fill(dstClient, dsturl.Absolute(), dsturl), nil
+}
+
+const incrementalBatchSize = 500
+
+// getObjectsIncremental uses the time-indexed cache to fetch only source objects
+// modified after modifiedAfter (O(log N + K) via Redis ZRANGEBYSCORE), then does
+// batch point lookups for destination. No S3 API calls, no full cache scan.
+func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFunc, redisURL string, srcurl, dsturl *url.URL, modifiedAfter time.Time) (chan *storage.Object, chan *storage.Object, error) {
+	srcClient, err := cache.New(redisURL, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	dstCacheClient, err := cache.New(redisURL, 0)
+	if err != nil {
+		srcClient.Close()
+		return nil, nil, err
+	}
+
+	extsortDefaultConfig := extsort.DefaultConfig()
+	extsortConfig := &extsort.Config{
+		ChunkSize:          extsortChunkSize,
+		NumWorkers:         extsortDefaultConfig.NumWorkers,
+		ChanBuffSize:       extsortChannelBufferSize,
+		SortedChanBuffSize: extsortChannelBufferSize,
+	}
+
+	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
+	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
+
+	go func() {
+		defer close(sourceObjects)
+		defer close(destObjects)
+		defer srcClient.Close()
+		defer dstCacheClient.Close()
+
+		// O(log N + K): get only source entries modified after last sync
+		srcPrefix := srcurl.Absolute()
+		if strings.HasSuffix(srcPrefix, "*") {
+			srcPrefix = srcPrefix[:len(srcPrefix)-1]
+		}
+		if !strings.HasSuffix(srcPrefix, "/") {
+			// Find the bucket prefix for the timeline key
+			if idx := strings.Index(srcPrefix[len("s3://"):], "/"); idx >= 0 {
+				srcPrefix = srcPrefix[:len("s3://")+idx+1]
+			}
+		}
+
+		modifiedEntries, err := srcClient.ScanModifiedAfter(ctx, srcPrefix, modifiedAfter)
+		if err != nil {
+			printError(s.fullCommand, s.op, err)
+			return
+		}
+
+		if len(modifiedEntries) == 0 {
+			return
+		}
+
+		// Sort the modified source objects
+		unsortedSrcCh := make(chan extsort.SortType, len(modifiedEntries))
+		go func() {
+			defer close(unsortedSrcCh)
+			for _, r := range modifiedEntries {
+				u, err := url.New(r.Path, url.WithRaw(s.raw))
+				if err != nil {
+					continue
+				}
+				u.SetRelative(srcurl)
+				modtime := r.Entry.ModTime
+				obj := storage.Object{
+					URL:     u,
+					Size:    r.Entry.Size,
+					ModTime: &modtime,
+					Etag:    r.Entry.Etag,
+				}
+				unsortedSrcCh <- obj
+			}
+		}()
+
+		sorter, srcOutputCh, srcErrCh := extsort.New(unsortedSrcCh, storage.FromBytes, storage.Less, extsortConfig)
+		sorter.Sort(ctx)
+
+		var sortedSrc []*storage.Object
+		for o := range srcOutputCh {
+			obj := o.(storage.Object)
+			sortedSrc = append(sortedSrc, &obj)
+		}
+		go func() {
+			for err := range srcErrCh {
+				printError(s.fullCommand, s.op, err)
+			}
+		}()
+
+		// Build destination paths for batch lookup
+		dstPrefix := dsturl.Absolute()
+		if !strings.HasSuffix(dstPrefix, "/") {
+			dstPrefix += "/"
+		}
+
+		dstPaths := make([]string, len(sortedSrc))
+		for i, obj := range sortedSrc {
+			rel := filepath.ToSlash(obj.URL.Relative())
+			if dsturl.IsRemote() {
+				dstPaths[i] = dstPrefix + rel
+			} else {
+				dstPaths[i] = filepath.Join(dsturl.Absolute(), rel)
+			}
+		}
+
+		// Batch lookup destination entries from cache
+		dstEntryMap := make(map[string]cache.Entry)
+		for i := 0; i < len(dstPaths); i += incrementalBatchSize {
+			end := i + incrementalBatchSize
+			if end > len(dstPaths) {
+				end = len(dstPaths)
+			}
+			batch, batchErr := dstCacheClient.GetPipelined(ctx, dstPaths[i:end])
+			if batchErr != nil {
+				printError(s.fullCommand, s.op, batchErr)
+				continue
+			}
+			for k, v := range batch {
+				dstEntryMap[k] = v
+			}
+		}
+
+		// Emit source and destination objects in sorted order
+		for i, srcObj := range sortedSrc {
+			sourceObjects <- srcObj
+
+			if dstEntry, ok := dstEntryMap[dstPaths[i]]; ok {
+				dstURL, err := url.New(dstPaths[i], url.WithRaw(s.raw))
+				if err == nil {
+					dstURL.SetRelative(dsturl)
+					modtime := dstEntry.ModTime
+					destObjects <- &storage.Object{
+						URL:     dstURL,
+						Size:    dstEntry.Size,
+						ModTime: &modtime,
+						Etag:    dstEntry.Etag,
+					}
+				}
+			}
+		}
+	}()
+
+	return sourceObjects, destObjects, nil
+}
+
+// getObjectsStartAfter uses S3 ListObjectsV2 with StartAfter parameter to only
+// list objects whose key is lexicographically after the last synced key.
+// For append-only sources with ordered filenames, this means S3 returns ONLY new objects.
+// Zero Redis scans, minimal S3 API pages (only pages containing new objects).
+func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFunc, redisURL string, srcurl, dsturl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
+	// Get the last synced key from Redis
+	markerClient, err := cache.New(redisURL, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	startAfterKey, _ := markerClient.GetLastStartAfter(ctx, s.src, s.dst)
+	markerClient.Close()
+
+	// Create S3 client
+	sourceClient, err := storage.NewRemoteClient(ctx, srcurl, s.storageOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create Redis client for destination lookups
+	dstCacheClient, err := cache.New(redisURL, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
+	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
+
+	go func() {
+		defer close(sourceObjects)
+		defer close(destObjects)
+		defer dstCacheClient.Close()
+
+		// List from S3 with StartAfter — S3 only returns keys > startAfterKey
+		var objCh <-chan *storage.Object
+		if startAfterKey != "" {
+			objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
+		} else {
+			// First run: list everything
+			objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
+		}
+
+		// Collect new source objects (already sorted by S3 key order)
+		var newObjects []*storage.Object
+		var lastKey string
+		for obj := range objCh {
+			if obj.Err != nil {
+				if s.shouldStopSync(obj.Err) {
+					printError(s.fullCommand, s.op, obj.Err)
+					cancel()
+					return
+				}
+				continue
+			}
+			if s.shouldSkipSrcObject(obj, false) {
+				continue
+			}
+			newObjects = append(newObjects, obj)
+			if obj.URL.Path > lastKey {
+				lastKey = obj.URL.Path
+			}
+		}
+
+		if len(newObjects) == 0 {
+			return
+		}
+
+		// Save the last key for next run
+		if lastKey != "" && s.redisURL != "" {
+			mkClient, err := cache.New(s.redisURL, 0)
+			if err == nil {
+				_ = mkClient.SetLastStartAfter(ctx, s.src, s.dst, lastKey)
+				mkClient.Close()
+			}
+		}
+
+		// Batch lookup destination entries from cache
+		dstPrefix := dsturl.Absolute()
+		if !strings.HasSuffix(dstPrefix, "/") {
+			dstPrefix += "/"
+		}
+
+		dstPaths := make([]string, len(newObjects))
+		for i, obj := range newObjects {
+			rel := filepath.ToSlash(obj.URL.Relative())
+			if dsturl.IsRemote() {
+				dstPaths[i] = dstPrefix + rel
+			} else {
+				dstPaths[i] = filepath.Join(dsturl.Absolute(), rel)
+			}
+		}
+
+		dstEntryMap := make(map[string]cache.Entry)
+		for i := 0; i < len(dstPaths); i += incrementalBatchSize {
+			end := i + incrementalBatchSize
+			if end > len(dstPaths) {
+				end = len(dstPaths)
+			}
+			batch, batchErr := dstCacheClient.GetPipelined(ctx, dstPaths[i:end])
+			if batchErr != nil {
+				printError(s.fullCommand, s.op, batchErr)
+				continue
+			}
+			for k, v := range batch {
+				dstEntryMap[k] = v
+			}
+		}
+
+		// Emit objects (S3 ListObjects already returns in sorted key order)
+		for i, srcObj := range newObjects {
+			sourceObjects <- srcObj
+
+			if dstEntry, ok := dstEntryMap[dstPaths[i]]; ok {
+				dstURL, err := url.New(dstPaths[i], url.WithRaw(s.raw))
+				if err == nil {
+					dstURL.SetRelative(dsturl)
+					modtime := dstEntry.ModTime
+					destObjects <- &storage.Object{
+						URL:     dstURL,
+						Size:    dstEntry.Size,
+						ModTime: &modtime,
+						Etag:    dstEntry.Etag,
+					}
+				}
+			}
+		}
+	}()
+
+	return sourceObjects, destObjects, nil
 }
 
 // shouldSkipObject checks is object should be skipped.

@@ -384,6 +384,63 @@ func (s *S3) listObjectsV2(ctx context.Context, url *url.URL) <-chan *Object {
 	return objCh
 }
 
+// ListStartAfter lists objects with keys lexicographically after startAfter.
+// Uses S3 ListObjectsV2 StartAfter parameter — S3 only returns objects after
+// the marker, so for append-only buckets with ordered keys this is O(K) not O(N).
+func (s *S3) ListStartAfter(ctx context.Context, url *url.URL, startAfter string) <-chan *Object {
+	listInput := s3.ListObjectsV2Input{
+		Bucket:       aws.String(url.Bucket),
+		Prefix:       aws.String(url.Prefix),
+		StartAfter:   aws.String(startAfter),
+		RequestPayer: s.RequestPayer(),
+	}
+
+	objCh := make(chan *Object)
+
+	go func() {
+		defer close(objCh)
+
+		var now time.Time
+
+		err := s.api.ListObjectsV2PagesWithContext(ctx, &listInput, func(p *s3.ListObjectsV2Output, lastPage bool) bool {
+			if now.IsZero() {
+				now = time.Now().UTC()
+			}
+			for _, c := range p.Contents {
+				key := aws.StringValue(c.Key)
+				if !url.Match(key) {
+					continue
+				}
+				mod := aws.TimeValue(c.LastModified).UTC()
+				if mod.After(now) {
+					continue
+				}
+				var objtype os.FileMode
+				if strings.HasSuffix(key, "/") {
+					objtype = os.ModeDir
+				}
+				newurl := url.Clone()
+				newurl.Path = key
+				etag := aws.StringValue(c.ETag)
+				objCh <- &Object{
+					URL:          newurl,
+					Etag:         strings.Trim(etag, `"`),
+					ModTime:      &mod,
+					Type:         ObjectType{objtype},
+					Size:         aws.Int64Value(c.Size),
+					StorageClass: StorageClass(aws.StringValue(c.StorageClass)),
+				}
+			}
+			return !lastPage
+		})
+		if err != nil {
+			objCh <- &Object{Err: err}
+		}
+	}()
+
+	return objCh
+}
+
 // listObjects is used for cloud services that does not support S3
 // ListObjectsV2 API. I'm looking at you GCS.
 func (s *S3) listObjects(ctx context.Context, url *url.URL) <-chan *Object {
