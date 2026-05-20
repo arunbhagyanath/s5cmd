@@ -718,7 +718,9 @@ func (s Sync) getObjectsFromCache(ctx context.Context, redisURL string, srcurl, 
 		return sortedCh
 	}
 
-	return fill(srcClient, srcurl.Absolute(), srcurl), fill(dstClient, dsturl.Absolute(), dsturl), nil
+	srcPrefix := cache.BucketPrefix(srcurl.Absolute())
+	dstPrefix := cache.BucketPrefix(dsturl.Absolute())
+	return fill(srcClient, srcPrefix, srcurl), fill(dstClient, dstPrefix, dsturl), nil
 }
 
 const incrementalBatchSize = 500

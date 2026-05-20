@@ -90,10 +90,10 @@ func shardKey(prefix, path string) string {
 	return fmt.Sprintf("%s%s:%d", indexPrefix, prefix, h%indexShards)
 }
 
-// bucketPrefix extracts the top-level prefix from an absolute path.
+// BucketPrefix extracts the top-level prefix from an absolute path.
 // "s3://bucket/blob-data#123" → "s3://bucket/"
 // "/data/blobs/blob-data#123" → "/data/blobs/"
-func bucketPrefix(path string) string {
+func BucketPrefix(path string) string {
 	if strings.HasPrefix(path, "s3://") {
 		rest := path[len("s3://"):]
 		if idx := strings.Index(rest, "/"); idx >= 0 {
@@ -135,9 +135,9 @@ func (c *Client) SetPipelined(ctx context.Context, entries map[string]Entry) err
 	pipe := c.rdb.Pipeline()
 	for path, e := range entries {
 		pipe.Set(ctx, key(path), entryToString(e), c.ttl)
-		pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
+		pipe.SAdd(ctx, shardKey(BucketPrefix(path), path), path)
 		// Add to time-indexed sorted set (score = unix nano of ModTime)
-		tlKey := timelinePrefix + bucketPrefix(path)
+		tlKey := timelinePrefix + BucketPrefix(path)
 		pipe.ZAdd(ctx, tlKey, redis.Z{Score: float64(e.ModTime.UnixNano()), Member: path})
 	}
 	_, err := pipe.Exec(ctx)
@@ -148,8 +148,8 @@ func (c *Client) SetIfAbsentPipelined(ctx context.Context, entries map[string]En
 	pipe := c.rdb.Pipeline()
 	for path, e := range entries {
 		pipe.SetNX(ctx, key(path), entryToString(e), c.ttl)
-		pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
-		tlKey := timelinePrefix + bucketPrefix(path)
+		pipe.SAdd(ctx, shardKey(BucketPrefix(path), path), path)
+		tlKey := timelinePrefix + BucketPrefix(path)
 		pipe.ZAdd(ctx, tlKey, redis.Z{Score: float64(e.ModTime.UnixNano()), Member: path})
 	}
 	_, err := pipe.Exec(ctx)
@@ -159,8 +159,8 @@ func (c *Client) SetIfAbsentPipelined(ctx context.Context, entries map[string]En
 func (c *Client) Set(ctx context.Context, path string, e Entry) error {
 	pipe := c.rdb.Pipeline()
 	pipe.Set(ctx, key(path), entryToString(e), c.ttl)
-	pipe.SAdd(ctx, shardKey(bucketPrefix(path), path), path)
-	tlKey := timelinePrefix + bucketPrefix(path)
+	pipe.SAdd(ctx, shardKey(BucketPrefix(path), path), path)
+	tlKey := timelinePrefix + BucketPrefix(path)
 	pipe.ZAdd(ctx, tlKey, redis.Z{Score: float64(e.ModTime.UnixNano()), Member: path})
 	_, err := pipe.Exec(ctx)
 	return err
