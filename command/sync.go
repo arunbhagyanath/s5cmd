@@ -99,6 +99,10 @@ func NewSyncCommandFlags() []cli.Flag {
 			Name:  "start-after",
 			Usage: "use S3 StartAfter to list only objects with keys after the last synced key (append-only ordered sources, requires --use-cache)",
 		},
+		&cli.BoolFlag{
+			Name:  "append-only",
+			Usage: "skip destination lookups; assume new source objects never exist in destination (use with --start-after for sequential append-only files)",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(syncFlags, sharedFlags...)
@@ -148,6 +152,7 @@ type Sync struct {
 	useCache      bool
 	sinceLastSync bool
 	startAfter    bool
+	appendOnly    bool
 	redisURL      string
 
 	// s3 options
@@ -176,6 +181,7 @@ func NewSync(c *cli.Context) Sync {
 		useCache:      c.Bool("use-cache"),
 		sinceLastSync: c.Bool("since-last-sync"),
 		startAfter:    c.Bool("start-after"),
+		appendOnly:    c.Bool("append-only"),
 		redisURL:      c.String("redis-url"),
 
 		// flags
@@ -236,7 +242,11 @@ func (s Sync) Run(c *cli.Context) error {
 			sourceObjects, destObjects, err = s.getObjectsFromCache(ctx, redisURL, srcurl, dsturl)
 		}
 	} else {
-		sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
+		if s.appendOnly {
+			sourceObjects, destObjects, err = s.getSourceOnlyObjects(ctx, cancel, srcurl)
+		} else {
+			sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
+		}
 	}
 	if err != nil {
 		printError(s.fullCommand, s.op, err)
@@ -914,27 +924,69 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 		return nil, nil, err
 	}
 
-	// Create Redis client for destination lookups
+	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
+	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
+
+	// Append-only streaming path: stream objects directly from S3 to channel
+	// without collecting into memory. Handles 40M+ files with constant memory.
+	if s.appendOnly {
+		go func() {
+			close(destObjects) // empty dest → all source objects go to onlySource
+
+			var objCh <-chan *storage.Object
+			if startAfterKey != "" {
+				objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
+			} else {
+				objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
+			}
+
+			var lastKey string
+			for obj := range objCh {
+				if obj.Err != nil {
+					if s.shouldStopSync(obj.Err) {
+						printError(s.fullCommand, s.op, obj.Err)
+						cancel()
+						break
+					}
+					continue
+				}
+				if s.shouldSkipSrcObject(obj, false) {
+					continue
+				}
+				obj.URL.SetRelative(srcurl)
+				if obj.URL.Path > lastKey {
+					lastKey = obj.URL.Path
+				}
+				sourceObjects <- obj
+			}
+			close(sourceObjects)
+
+			// Save the last key for next run
+			if lastKey != "" && s.redisURL != "" {
+				mkClient, mkErr := cache.New(s.redisURL, 0)
+				if mkErr == nil {
+					_ = mkClient.SetLastStartAfter(ctx, s.src, s.dst, lastKey)
+					mkClient.Close()
+				}
+			}
+		}()
+		return sourceObjects, destObjects, nil
+	}
+
+	// Non-append-only path: collect objects then do destination lookups
 	dstCacheClient, err := cache.New(redisURL, 0)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
-	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
-
-	// We collect all objects first, then emit via separate goroutines to avoid
-	// deadlock: compareObjects reads both channels in merge-sort fashion, so
-	// writing both from one goroutine can block when buffers fill.
 	type pair struct {
 		src *storage.Object
-		dst *storage.Object // nil if not in destination cache
+		dst *storage.Object
 	}
 
 	go func() {
 		defer dstCacheClient.Close()
 
-		// List from S3 with StartAfter — S3 only returns keys > startAfterKey
 		var objCh <-chan *storage.Object
 		if startAfterKey != "" {
 			objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
@@ -942,7 +994,6 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
 		}
 
-		// Collect new source objects (already sorted by S3 key order)
 		var newObjects []*storage.Object
 		var lastKey string
 		for obj := range objCh {
@@ -972,10 +1023,9 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			return
 		}
 
-		// Save the last key for next run
 		if lastKey != "" && s.redisURL != "" {
-			mkClient, err := cache.New(s.redisURL, 0)
-			if err == nil {
+			mkClient, mkErr := cache.New(s.redisURL, 0)
+			if mkErr == nil {
 				_ = mkClient.SetLastStartAfter(ctx, s.src, s.dst, lastKey)
 				mkClient.Close()
 			}
@@ -1013,7 +1063,6 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
-		// Build pairs
 		pairs := make([]pair, len(newObjects))
 		for i, srcObj := range newObjects {
 			pairs[i].src = srcObj
@@ -1032,7 +1081,6 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
-		// Emit via separate goroutines to avoid deadlock with compareObjects
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
@@ -1052,6 +1100,39 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			close(destObjects)
 		}()
 		wg.Wait()
+	}()
+
+	return sourceObjects, destObjects, nil
+}
+
+// getSourceOnlyObjects lists source objects without listing destination at all.
+// Used with --append-only when new files are guaranteed to not exist in destination.
+func (s Sync) getSourceOnlyObjects(ctx context.Context, cancel context.CancelFunc, srcurl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
+	sourceClient, err := storage.NewClient(ctx, srcurl, s.storageOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
+	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
+
+	go func() {
+		defer close(sourceObjects)
+		close(destObjects) // empty dest → all source objects treated as new
+		for obj := range sourceClient.List(ctx, srcurl, s.followSymlinks) {
+			if obj.Err != nil {
+				if s.shouldStopSync(obj.Err) {
+					printError(s.fullCommand, s.op, obj.Err)
+					cancel()
+					return
+				}
+				continue
+			}
+			if s.shouldSkipSrcObject(obj, true) {
+				continue
+			}
+			sourceObjects <- obj
+		}
 	}()
 
 	return sourceObjects, destObjects, nil
