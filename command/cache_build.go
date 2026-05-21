@@ -38,6 +38,10 @@ func NewCacheBuildCommand() *cli.Command {
 				Name:  "resume",
 				Usage: "skip objects already present in cache, allowing interrupted builds to continue",
 			},
+			&cli.StringFlag{
+				Name:  "sync-to",
+				Usage: "destination path; saves the last-key marker so subsequent sync --start-after --append-only skips already-cached objects",
+			},
 		},
 		Action: runCacheBuild,
 	}
@@ -71,20 +75,29 @@ func runCacheBuild(c *cli.Context) error {
 
 	log.Info(log.InfoMessage{Operation: "cache-build", Source: srcurl})
 
-	count, err := parallelCacheBuild(ctx, client, storageClient, srcurl, c.Int("cache-workers"), c.Bool("resume"))
+	count, lastKey, err := parallelCacheBuild(ctx, client, storageClient, srcurl, c.Int("cache-workers"), c.Bool("resume"))
 	if err != nil {
 		log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("cache build failed after %d objects: %v", count, err)})
 		return err
+	}
+
+	// Save start-after marker for sync --append-only
+	if syncTo := c.String("sync-to"); syncTo != "" && lastKey != "" {
+		src := c.Args().First()
+		if err := client.SetLastStartAfter(ctx, src, syncTo, lastKey); err != nil {
+			log.Error(log.ErrorMessage{Operation: "cache-build", Err: fmt.Sprintf("failed to save start-after marker: %v", err)})
+		}
 	}
 
 	log.Info(cacheBuildDoneMessage{Source: srcurl.Absolute(), Count: count})
 	return nil
 }
 
-func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL, workers int, resume bool) (int64, error) {
+func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient storage.Storage, srcurl *url.URL, workers int, resume bool) (int64, string, error) {
 	batchCh := make(chan map[string]cache.Entry, workers*2)
 
 	var total atomic.Int64
+	var lastKey string
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 
@@ -131,6 +144,7 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 				ModTime: modtime,
 				Etag:    obj.Etag,
 			}
+			lastKey = obj.URL.Path
 			log.Debug(cacheBuildObjectMessage{Path: obj.URL.Absolute(), Size: obj.Size})
 			if len(batch) >= cacheBuildBatchSize {
 				batchCh <- batch
@@ -144,7 +158,7 @@ func parallelCacheBuild(ctx context.Context, client *cache.Client, storageClient
 
 	wg.Wait()
 	close(errCh)
-	return total.Load(), <-errCh
+	return total.Load(), lastKey, <-errCh
 }
 
 type cacheBuildDoneMessage struct {

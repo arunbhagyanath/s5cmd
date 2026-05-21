@@ -242,11 +242,7 @@ func (s Sync) Run(c *cli.Context) error {
 			sourceObjects, destObjects, err = s.getObjectsFromCache(ctx, redisURL, srcurl, dsturl)
 		}
 	} else {
-		if s.appendOnly {
-			sourceObjects, destObjects, err = s.getSourceOnlyObjects(ctx, cancel, srcurl)
-		} else {
-			sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
-		}
+		sourceObjects, destObjects, err = s.getSourceAndDestinationObjects(ctx, cancel, srcurl, dsturl)
 	}
 	if err != nil {
 		printError(s.fullCommand, s.op, err)
@@ -929,16 +925,13 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 
 	// Append-only streaming path: stream objects directly from S3 to channel
 	// without collecting into memory. Handles 40M+ files with constant memory.
-	if s.appendOnly {
+	// Only used when we have a marker (subsequent runs) — on first run we fall
+	// through to the normal path that compares both sides to skip existing files.
+	if s.appendOnly && startAfterKey != "" {
 		go func() {
 			close(destObjects) // empty dest → all source objects go to onlySource
 
-			var objCh <-chan *storage.Object
-			if startAfterKey != "" {
-				objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
-			} else {
-				objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
-			}
+			objCh := sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
 
 			var lastKey string
 			for obj := range objCh {
@@ -1100,39 +1093,6 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			close(destObjects)
 		}()
 		wg.Wait()
-	}()
-
-	return sourceObjects, destObjects, nil
-}
-
-// getSourceOnlyObjects lists source objects without listing destination at all.
-// Used with --append-only when new files are guaranteed to not exist in destination.
-func (s Sync) getSourceOnlyObjects(ctx context.Context, cancel context.CancelFunc, srcurl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
-	sourceClient, err := storage.NewClient(ctx, srcurl, s.storageOpts)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
-	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
-
-	go func() {
-		defer close(sourceObjects)
-		close(destObjects) // empty dest → all source objects treated as new
-		for obj := range sourceClient.List(ctx, srcurl, s.followSymlinks) {
-			if obj.Err != nil {
-				if s.shouldStopSync(obj.Err) {
-					printError(s.fullCommand, s.op, obj.Err)
-					cancel()
-					return
-				}
-				continue
-			}
-			if s.shouldSkipSrcObject(obj, true) {
-				continue
-			}
-			sourceObjects <- obj
-		}
 	}()
 
 	return sourceObjects, destObjects, nil
