@@ -929,33 +929,62 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
 
 	// listAfterMarker returns a channel of source objects after startAfterKey.
-	// For S3 sources, uses ListStartAfter API. For local sources, lists all and filters.
+	// For S3 sources, uses ListStartAfter API. For local sources, uses os.ReadDir
+	// (sorted) with binary search to skip directly to the marker — O(log N) skip
+	// instead of walking all N files.
 	listAfterMarker := func(marker string) <-chan *storage.Object {
 		if srcurl.IsRemote() && marker != "" {
 			return sourceClient.(interface {
 				ListStartAfter(context.Context, *url.URL, string) <-chan *storage.Object
 			}).ListStartAfter(ctx, srcurl, marker)
 		}
-		// Local or no marker: list all, filter in-stream.
-		raw := sourceClient.List(ctx, srcurl, s.followSymlinks)
-		if marker == "" {
-			return raw
+		if srcurl.IsRemote() || marker == "" {
+			return sourceClient.List(ctx, srcurl, s.followSymlinks)
 		}
-		filtered := make(chan *storage.Object, extsortChannelBufferSize)
+		// Local source with marker: read sorted dir entries, binary-search past marker.
+		ch := make(chan *storage.Object, extsortChannelBufferSize)
 		go func() {
-			defer close(filtered)
-			for obj := range raw {
-				if obj.Err != nil {
-					filtered <- obj
+			defer close(ch)
+			entries, err := os.ReadDir(srcurl.Absolute())
+			if err != nil {
+				ch <- &storage.Object{Err: err}
+				return
+			}
+			// Binary search for first entry > marker
+			lo, hi := 0, len(entries)
+			for lo < hi {
+				mid := (lo + hi) / 2
+				if entries[mid].Name() <= marker {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			for _, de := range entries[lo:] {
+				if de.IsDir() {
 					continue
 				}
-				if filepath.Base(obj.URL.Path) <= marker {
+				fullPath := filepath.Join(srcurl.Absolute(), de.Name())
+				fi, err := de.Info()
+				if err != nil {
+					ch <- &storage.Object{Err: err}
 					continue
 				}
-				filtered <- obj
+				u, err := url.New(fullPath)
+				if err != nil {
+					ch <- &storage.Object{Err: err}
+					continue
+				}
+				u.SetRelative(srcurl)
+				mod := fi.ModTime()
+				select {
+				case ch <- &storage.Object{URL: u, Size: fi.Size(), ModTime: &mod}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
-		return filtered
+		return ch
 	}
 
 	// Append-only streaming path: empty dest channel → all objects go to onlySource.
