@@ -901,10 +901,10 @@ func (s Sync) getObjectsIncremental(ctx context.Context, cancel context.CancelFu
 	return sourceObjects, destObjects, nil
 }
 
-// getObjectsStartAfter uses S3 ListObjectsV2 with StartAfter parameter to only
-// list objects whose key is lexicographically after the last synced key.
-// For append-only sources with ordered filenames, this means S3 returns ONLY new objects.
-// Zero Redis scans, minimal S3 API pages (only pages containing new objects).
+// getObjectsStartAfter lists only source objects whose key is lexicographically
+// after the last synced key stored in Redis.
+// For S3 sources it uses ListObjectsV2 StartAfter (zero full scans).
+// For local sources it lists all files and skips those <= the marker.
 func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFunc, redisURL string, srcurl, dsturl *url.URL) (chan *storage.Object, chan *storage.Object, error) {
 	// Get the last synced key from Redis
 	markerClient, err := cache.New(redisURL, 0)
@@ -914,8 +914,13 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 	startAfterKey, _ := markerClient.GetLastStartAfter(ctx, s.src, s.dst)
 	markerClient.Close()
 
-	// Create S3 client
-	sourceClient, err := storage.NewRemoteClient(ctx, srcurl, s.storageOpts)
+	// Create source client — local or remote depending on source URL.
+	var sourceClient storage.Storage
+	if srcurl.IsRemote() {
+		sourceClient, err = storage.NewRemoteClient(ctx, srcurl, s.storageOpts)
+	} else {
+		sourceClient = storage.NewLocalClient(s.storageOpts)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -923,15 +928,43 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 	sourceObjects := make(chan *storage.Object, extsortChannelBufferSize)
 	destObjects := make(chan *storage.Object, extsortChannelBufferSize)
 
-	// Append-only streaming path: stream objects directly from S3 to channel
-	// without collecting into memory. Handles 40M+ files with constant memory.
-	// Only used when we have a marker (subsequent runs) — on first run we fall
-	// through to the normal path that compares both sides to skip existing files.
+	// listAfterMarker returns a channel of source objects after startAfterKey.
+	// For S3 sources, uses ListStartAfter API. For local sources, lists all and filters.
+	listAfterMarker := func(marker string) <-chan *storage.Object {
+		if srcurl.IsRemote() && marker != "" {
+			return sourceClient.(interface {
+				ListStartAfter(context.Context, *url.URL, string) <-chan *storage.Object
+			}).ListStartAfter(ctx, srcurl, marker)
+		}
+		// Local or no marker: list all, filter in-stream.
+		raw := sourceClient.List(ctx, srcurl, s.followSymlinks)
+		if marker == "" {
+			return raw
+		}
+		filtered := make(chan *storage.Object, extsortChannelBufferSize)
+		go func() {
+			defer close(filtered)
+			for obj := range raw {
+				if obj.Err != nil {
+					filtered <- obj
+					continue
+				}
+				if filepath.Base(obj.URL.Path) <= marker {
+					continue
+				}
+				filtered <- obj
+			}
+		}()
+		return filtered
+	}
+
+	// Append-only streaming path: empty dest channel → all objects go to onlySource.
+	// Used on subsequent runs (marker exists) for constant-memory streaming.
 	if s.appendOnly && startAfterKey != "" {
 		go func() {
-			close(destObjects) // empty dest → all source objects go to onlySource
+			close(destObjects)
 
-			objCh := sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
+			objCh := listAfterMarker(startAfterKey)
 
 			var lastKey string
 			for obj := range objCh {
@@ -947,8 +980,9 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 					continue
 				}
 				obj.URL.SetRelative(srcurl)
-				if obj.URL.Path > lastKey {
-					lastKey = obj.URL.Path
+				key := filepath.Base(obj.URL.Path)
+				if key > lastKey {
+					lastKey = key
 				}
 				sourceObjects <- obj
 			}
@@ -980,12 +1014,7 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 	go func() {
 		defer dstCacheClient.Close()
 
-		var objCh <-chan *storage.Object
-		if startAfterKey != "" {
-			objCh = sourceClient.ListStartAfter(ctx, srcurl, startAfterKey)
-		} else {
-			objCh = sourceClient.List(ctx, srcurl, s.followSymlinks)
-		}
+		objCh := listAfterMarker(startAfterKey)
 
 		var newObjects []*storage.Object
 		var lastKey string
@@ -1005,8 +1034,12 @@ func (s Sync) getObjectsStartAfter(ctx context.Context, cancel context.CancelFun
 			}
 			obj.URL.SetRelative(srcurl)
 			newObjects = append(newObjects, obj)
-			if obj.URL.Path > lastKey {
-				lastKey = obj.URL.Path
+			key := obj.URL.Path
+			if !srcurl.IsRemote() {
+				key = filepath.Base(obj.URL.Path)
+			}
+			if key > lastKey {
+				lastKey = key
 			}
 		}
 
